@@ -1,0 +1,430 @@
+import asyncio
+import json
+import signal
+import time
+import argparse
+from dataclasses import dataclass
+from typing import Optional, List, Tuple, Dict
+
+import requests
+from datetime import datetime, timedelta, timezone
+
+# ---- Config ----
+WSS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+CLOB = "https://clob.polymarket.com"
+GAMMA = "https://gamma-api.polymarket.com"
+UTC = timezone.utc
+
+# ---- Generic helpers for arrays/outcomes ----
+def normalize_array(raw):
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        s = raw.strip()
+        if s.startswith("[") and s.endswith("]"):
+            try:
+                import json as _json
+                parsed = _json.loads(s)
+                if isinstance(parsed, list):
+                    return [str(x) for x in parsed]
+            except Exception:
+                pass
+        return [s]
+    if isinstance(raw, (list, tuple)):
+        return [str(x) for x in raw]
+    return [str(raw)]
+
+def map_up_down_indices(outcomes):
+    lowered = [o.lower() for o in outcomes]
+    up_idx = lowered.index("up") if "up" in lowered else (0 if outcomes else None)
+    down_idx = lowered.index("down") if "down" in lowered else (1 if len(outcomes) > 1 else None)
+    if down_idx == up_idx and len(outcomes) >= 2:
+        down_idx = 1 if up_idx == 0 else 0
+    return up_idx, down_idx
+
+# ---- Gamma helpers to find current-hour BTC UP token ----
+def get_events(start_dt: datetime, end_dt: datetime, limit=250, offset=0):
+    params = {
+        "limit": limit,
+        "offset": offset,
+        "order": "startDate",
+        "ascending": True,
+        "start_date_min": start_dt.isoformat().replace("+00:00", "Z"),
+        "start_date_max": end_dt.isoformat().replace("+00:00", "Z"),
+    }
+    r = requests.get(f"{GAMMA}/events", params=params, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def get_current_hour_btc_up_token() -> Optional[Tuple[str, str, str, str]]:
+    """
+    Find the bitcoin-up-or-down event whose market window contains *now* (UTC),
+    return (token_id, event_slug, start_iso_utc, end_iso_utc). None if not found.
+    """
+    now = datetime.now(tz=UTC)
+    start_window = now - timedelta(days=1)
+    end_window = now + timedelta(days=1)
+
+    events = []
+    offset = 0
+    while True:
+        batch = get_events(start_window, end_window, limit=250, offset=offset)
+        if not batch:
+            break
+        events.extend(batch)
+        if len(batch) < 250:
+            break
+        offset += 250
+
+    btc_events = [e for e in events if str(e.get("slug", "")).startswith("bitcoin-up-or-down-")]
+
+    candidates: List[Tuple[str, str, datetime, datetime]] = []
+    for ev in btc_events:
+        slug = ev.get("slug")
+        try:
+            resp = requests.get(f"{GAMMA}/events/slug/{slug}", timeout=30)
+            if resp.status_code == 404:
+                continue
+            resp.raise_for_status()
+        except Exception:
+            continue
+
+        ev_data = resp.json()
+        for m in (ev_data.get("markets") or []):
+            if not m.get("enableOrderBook"):
+                continue
+            try:
+                sdt = datetime.fromisoformat(m["startDate"].replace("Z", "+00:00"))
+                edt = datetime.fromisoformat(m["endDate"].replace("Z", "+00:00"))
+            except Exception:
+                continue
+
+            if sdt <= now < edt:
+                outcomes = normalize_array(m.get("shortOutcomes") or m.get("outcomes"))
+                token_ids = normalize_array(m.get("clobTokenIds"))
+                up_idx, _ = map_up_down_indices(outcomes)
+                if up_idx is None or up_idx >= len(token_ids):
+                    continue
+                candidates.append((token_ids[up_idx], slug, sdt, edt))
+
+    if not candidates:
+        return None
+
+    tok, slug, sdt, edt = sorted(candidates, key=lambda x: x[3])[0]
+    return tok, slug, sdt.strftime("%Y-%m-%d %H:%M:%S"), edt.strftime("%Y-%m-%d %H:%M:%S")
+
+# ---- Time helpers ----
+def floor_minute(ts_s: int) -> int:
+    return (ts_s // 60) * 60
+
+def ceil_to_next_minute(ts_s: int) -> int:
+    return ((ts_s + 59) // 60) * 60
+
+def parse_float(x) -> Optional[float]:
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+# ---- Price state & display-price rule ----
+@dataclass
+class PriceState:
+    best_bid: Optional[float] = None
+    best_ask: Optional[float] = None
+    last_trade_price: Optional[float] = None
+
+    def display_price(self) -> Optional[float]:
+        """
+        Polymarket UI rule: midpoint unless spread > $0.10, then last trade.
+        If last trade missing, fall back to midpoint when available.
+        """
+        b, a, ltp = self.best_bid, self.best_ask, self.last_trade_price
+        if b is not None and a is not None:
+            spread = a - b
+            mid = (a + b) / 2.0
+            if spread > 0.10 and ltp is not None:
+                return ltp
+            return mid
+        if ltp is not None:
+            return ltp
+        return None
+
+# ---- Core capture & compare ----
+async def ws_capture_prices(token_id: str, duration_secs: int, sample_every: float = 1.0):
+    """
+    Subscribes to MARKET channel for `token_id`, captures state changes,
+    and samples a display price every `sample_every` seconds for `duration_secs`.
+    Returns: (samples, t_start, t_end)
+    """
+    try:
+        import websockets  # pip install websockets
+    except ImportError as e:
+        raise SystemExit("Please install the 'websockets' package: pip install websockets") from e
+
+    state = PriceState()
+    samples: List[Tuple[int, Optional[float], Optional[float], Optional[float], Optional[float]]] = []
+
+    # Align to the next minute for clean minute buckets
+    start_wall = int(time.time())
+    start_bucket = ceil_to_next_minute(start_wall)
+    wait = start_bucket - start_wall
+    if wait > 0:
+        print(f"Aligning to next minute boundary in {wait}s…")
+        await asyncio.sleep(wait)
+
+    t_start = int(time.time())
+    t_end = t_start + duration_secs
+    print(f"Capture window: {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(t_start))} "
+          f"→ {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(t_end))} (UTC)")
+
+    import contextlib
+    async with websockets.connect(
+        WSS_URL,
+        max_queue=None,
+        ping_interval=None  # we send text "PING"
+    ) as ws:
+        # Subscribe to MARKET channel for this token
+        sub_msg = {"type": "market", "assets_ids": [token_id]}
+        await ws.send(json.dumps(sub_msg))
+
+        # ---- Robust message handler -----------------------------------------
+        def handle_msg(obj):
+            """Update state from a dict/list/str payload."""
+            if obj is None:
+                return
+            # List of messages? handle each
+            if isinstance(obj, list):
+                for item in obj:
+                    handle_msg(item)
+                return
+            # Simple heartbeat strings?
+            if isinstance(obj, str):
+                # ignore "PONG", "PING", etc.
+                return
+            if not isinstance(obj, dict):
+                return
+
+            et = obj.get("event_type") or obj.get("type")
+
+            # Book snapshots (sometimes arrive without explicit event_type)
+            if et == "book" or any(k in obj for k in ("bids", "asks", "buys", "sells")):
+                bids = obj.get("bids") or obj.get("buys") or []
+                asks = obj.get("asks") or obj.get("sells") or []
+                if bids:
+                    b0 = parse_float((bids[0].get("price") if isinstance(bids[0], dict) else bids[0]))
+                    if b0 is not None:
+                        state.best_bid = b0
+                if asks:
+                    a0 = parse_float((asks[0].get("price") if isinstance(asks[0], dict) else asks[0]))
+                    if a0 is not None:
+                        state.best_ask = a0
+                return
+
+            # Price changes
+            if et == "price_change" or "price_changes" in obj:
+                changes = obj.get("price_changes") or obj.get("changes") or []
+                if isinstance(changes, dict):
+                    changes = [changes]
+                for ch in changes:
+                    if not isinstance(ch, dict):
+                        continue
+                    bb = parse_float(ch.get("best_bid") or ch.get("bb"))
+                    aa = parse_float(ch.get("best_ask") or ch.get("ba"))
+                    if bb is not None:
+                        state.best_bid = bb
+                    if aa is not None:
+                        state.best_ask = aa
+                return
+
+            # Last trade price
+            if et == "last_trade_price" or "last_trade_price" in obj or obj.get("kind") == "last_trade":
+                ltp = parse_float(obj.get("price") or obj.get("last_trade_price"))
+                if ltp is not None:
+                    state.last_trade_price = ltp
+                return
+        # ---------------------------------------------------------------------
+
+        async def reader():
+            async for raw in ws:
+                # Try to parse JSON frames; ignore non-JSON heartbeats
+                try:
+                    msg = json.loads(raw)
+                except Exception:
+                    # e.g., "PONG"
+                    continue
+                handle_msg(msg)
+
+        async def sampler():
+            next_tick = time.time()
+            while int(time.time()) < t_end:
+                next_tick += sample_every
+                dp = state.display_price()
+                ts_sec = int(time.time())
+                samples.append((ts_sec, dp, state.best_bid, state.best_ask, state.last_trade_price))
+                await asyncio.sleep(max(0, next_tick - time.time()))
+
+        async def pinger():
+            try:
+                while True:
+                    await ws.send("PING")
+                    await asyncio.sleep(10)
+            except Exception:
+                pass
+
+        # Run reader + pinger in background; stop them when sampler ends
+        reader_task = asyncio.create_task(reader())
+        pinger_task = asyncio.create_task(pinger())
+        try:
+            await sampler()
+        finally:
+            for t in (reader_task, pinger_task):
+                t.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await reader_task
+                await pinger_task
+
+    return samples, t_start, t_end
+
+def minute_bucketize(samples: List[Tuple[int, Optional[float], Optional[float], Optional[float], Optional[float]]],
+                     t_start: int, t_end: int) -> Dict[int, Dict[str, Optional[float]]]:
+    """
+    Builds per-minute stats from per-second samples.
+    Returns dict keyed by minute_start_ts with:
+      - start: first sample in [t, t+60)
+      - end: last sample in [t, t+60)
+      - avg: arithmetic mean of display_price over samples in [t, t+60)
+    """
+    t0 = ceil_to_next_minute(t_start)
+    t1 = (t_end // 60) * 60
+    buckets: Dict[int, Dict[str, Optional[float]]] = {}
+    if t1 <= t0:
+        return buckets
+
+    by_bucket: Dict[int, List[float]] = {}
+    start_values: Dict[int, Optional[float]] = {}
+    end_values: Dict[int, Optional[float]] = {}
+
+    for ts, dp, *_ in samples:
+        if dp is None:
+            continue
+        if ts < t0 or ts >= t1:
+            continue
+        m = (ts // 60) * 60
+        by_bucket.setdefault(m, []).append(dp)
+        if m not in start_values:
+            start_values[m] = dp
+        end_values[m] = dp
+
+    for m in range(t0, t1, 60):
+        arr = by_bucket.get(m, [])
+        avg = sum(arr) / len(arr) if arr else None
+        buckets[m] = {"start": start_values.get(m), "end": end_values.get(m), "avg": avg}
+    return buckets
+
+def fetch_prices_history(token_id: str, start_ts: int, end_ts: int):
+    """
+    Calls /prices-history with fidelity=1 minute.
+    """
+    params = {"market": token_id, "startTs": start_ts, "endTs": end_ts, "fidelity": 1}
+    r = requests.get(f"{CLOB}/prices-history", params=params, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    hist = data.get("history", data)
+    return {int(pt["t"]): float(pt["p"]) for pt in hist if "t" in pt and "p" in pt}
+
+def compare_series(buckets: Dict[int, Dict[str, Optional[float]]],
+                   history: Dict[int, float]) -> Dict[str, Dict[str, float]]:
+    """
+    Compares per-minute start/end/avg vs REST history (absolute error).
+    """
+    rows = []
+    for m, v in sorted(buckets.items()):
+        if m not in history:
+            continue
+        h = history[m]
+        s = v.get("start")
+        e = v.get("end")
+        a = v.get("avg")
+        rows.append({
+            "minute": m,
+            "history": h,
+            "start": s,
+            "end": e,
+            "avg": a,
+            "err_start": abs(h - s) if s is not None else None,
+            "err_end": abs(h - e) if e is not None else None,
+            "err_avg": abs(h - a) if a is not None else None,
+        })
+
+    if not rows:
+        print("No overlapping minute buckets between samples and /prices-history.")
+        return {}
+
+    print("\nMinute comparison (UTC):")
+    print("minute_iso           hist    start   end     avg     | err_start err_end err_avg")
+    best_counts = {"start": 0, "end": 0, "avg": 0}
+    mae = {"start": 0.0, "end": 0.0, "avg": 0.0}
+    n = 0
+
+    for r in rows:
+        mi = time.strftime('%Y-%m-%d %H:%M', time.gmtime(r["minute"]))
+        def f(x): return f"{x:.4f}" if x is not None else "None"
+        print(f"{mi}    {f(r['history'])}  {f(r['start'])}  {f(r['end'])}  {f(r['avg'])}  | "
+              f"{f(r['err_start'])}   {f(r['err_end'])}  {f(r['err_avg'])}")
+        errs = {k: r[f"err_{k}"] for k in ("start", "end", "avg")}
+        errs = {k: v for k, v in errs.items() if v is not None}
+        if errs:
+            winner = min(errs, key=errs.get)
+            best_counts[winner] += 1
+            for k, v in errs.items():
+                mae[k] += v
+            n += 1
+
+    if n:
+        for k in mae:
+            mae[k] = mae[k] / n
+    print("\nWhich matched most minutes?")
+    print(best_counts)
+    print("Mean absolute error by method:")
+    print({k: round(v, 5) for k, v in mae.items()})
+    return {"wins": best_counts, "mae": mae}
+
+# ---- CLI ----
+def main():
+    ap = argparse.ArgumentParser(
+        description="Capture live WS prices and compare to /prices-history minute points."
+    )
+    ap.add_argument("--token-id", help="CLOB token_id to observe (UP leg). If omitted, auto-detects current-hour BTC UP.")
+    ap.add_argument("--minutes", type=int, default=5, help="How many minutes to capture (default 5)")
+    ap.add_argument("--sample-sec", type=float, default=1.0, help="Sampling period in seconds (default 1.0)")
+    args = ap.parse_args()
+
+    # Resolve token id
+    token_id = args.token_id
+    if not token_id:
+        print("No --token-id provided; attempting to auto-detect the current-hour BTC UP token…")
+        found = get_current_hour_btc_up_token()
+        if not found:
+            raise SystemExit("Could not find a current-hour BTC Up/Down market.")
+        token_id, slug, start_iso, end_iso = found
+        print(f"Using current-hour market:\n  slug: {slug}\n  window (UTC): {start_iso} → {end_iso}\n  UP token_id: {token_id}")
+
+    # Allow Ctrl+C clean exit
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+    # Run capture
+    samples, t_start, t_end = asyncio.run(ws_capture_prices(token_id, args.minutes * 60, args.sample_sec))
+
+    # Build per-minute buckets from the 1s samples
+    buckets = minute_bucketize(samples, t_start, t_end)
+
+    # Fetch REST minute series for the same window (pad by +1m each side just in case)
+    start_min = ceil_to_next_minute(t_start) - 60
+    end_min = ceil_to_next_minute(t_end) + 60
+    hist = fetch_prices_history(token_id, start_min, end_min)
+
+    # Compare & report
+    compare_series(buckets, hist)
+
+if __name__ == "__main__":
+    main()
